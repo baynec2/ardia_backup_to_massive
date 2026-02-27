@@ -10,7 +10,6 @@ This project automates the transfer of mass spectrometry `.raw` files from the A
 
 - `backup-db/` — PostgreSQL dump (`.sql.gz`) exported from the Ardia. Contains the mapping data.
 - `backup-raw-data/` — Sample `.raw` files organized by backup timestamp → `YYYY/MM/DD/<uuid>.raw`. The UUID filenames are the hashed names used on the Ardia.
-- `infra-minio-backup/` — (Currently empty) Intended for MinIO backup infrastructure.
 
 ## Key Database Schema
 

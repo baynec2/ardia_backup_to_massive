@@ -104,6 +104,5 @@ docker run --rm \
 ├── transfer_to_massive.py  # Step 2: FTP upload to MassIVE
 ├── Dockerfile
 ├── backup-db/              # Place .sql.gz dump here (not committed)
-├── backup-raw-data/        # Place UUID .raw files here (not committed)
-└── infra-minio-backup/     # Future: MinIO backup infrastructure
+└── backup-raw-data/        # Place UUID .raw files here (not committed)
 ```
