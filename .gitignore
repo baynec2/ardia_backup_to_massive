@@ -1,0 +1,14 @@
+# Data directories (real data — do not commit)
+backup-db/
+backup-raw-data/
+
+# Script outputs
+mapping.csv
+transfer_log.csv
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
