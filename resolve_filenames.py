@@ -34,6 +34,10 @@ import sys
 from pathlib import Path
 
 
+# Candidate timestamp column names to probe on audit_log (in priority order).
+_TS_CANDIDATES = ["occurred_at", "created_at", "logged_at", "timestamp", "event_time"]
+
+
 # ---------------------------------------------------------------------------
 # Dump parser
 # ---------------------------------------------------------------------------
@@ -111,16 +115,64 @@ def load_from_db(host, port, dbname, user, password):
     cur.execute('SELECT "Id", "InjectionId" FROM standard_sequence."InjectionVersion"')
     injection_versions = [dict(r) for r in cur.fetchall()]
 
-    cur.execute("""
-        SELECT subject_id, subject_name, subject_path
-        FROM audit.audit_log
-        WHERE subject_type = 'Raw File' AND subject_path IS NOT NULL
+    # Probe for a timestamp column so _pick_latest_audit_row can sort authoritatively.
+    ts_candidates_sql = ", ".join(f"'{c}'" for c in _TS_CANDIDATES)
+    cur.execute(f"""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'audit'
+          AND table_name   = 'audit_log'
+          AND column_name  IN ({ts_candidates_sql})
+        ORDER BY ordinal_position
+        LIMIT 1
     """)
+    ts_row = cur.fetchone()
+    ts_col = ts_row[0] if ts_row else None
+
+    if ts_col:
+        cur.execute(f"""
+            SELECT subject_id, subject_name, subject_path, {ts_col}
+            FROM audit.audit_log
+            WHERE subject_type = 'Raw File' AND subject_path IS NOT NULL
+            ORDER BY {ts_col} ASC
+        """)
+    else:
+        cur.execute("""
+            SELECT subject_id, subject_name, subject_path
+            FROM audit.audit_log
+            WHERE subject_type = 'Raw File' AND subject_path IS NOT NULL
+        """)
     audit_log = [dict(r) for r in cur.fetchall()]
 
     conn.close()
     return {"RawData": raw_data, "InjectionVersion": injection_versions,
             "audit_log": audit_log}
+
+
+# ---------------------------------------------------------------------------
+# Audit-row helpers
+# ---------------------------------------------------------------------------
+
+def _pick_latest_audit_row(rows):
+    """
+    Given a list of audit_log row dicts that share the same (subject_id, subject_name),
+    return the single row representing the file's current location.
+
+    Strategy:
+      1. Find the first timestamp column present and non-null in any row.
+      2. If found, return the row with the maximum value for that column
+         (string comparison is safe for ISO-8601 timestamps).
+      3. Fallback: return the last row in the list (dump/query order is
+         append-order for an audit log, so last == most recent move).
+    """
+    if len(rows) == 1:
+        return rows[0]
+
+    for ts_col in _TS_CANDIDATES:
+        if any(r.get(ts_col) for r in rows):
+            return max(rows, key=lambda r: r.get(ts_col) or "")
+
+    return rows[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +196,10 @@ def build_mapping(tables):
 
     # (injection_id, subject_name) → subject_path  — from audit_log Raw File rows
     # subject_path already ends with the filename, so we append .raw for the destination.
-    audit_index = {}
+    #
+    # Phase 1: group all rows by key (preserving encounter order so that
+    #          last-in-sequence == most-recent-move when no timestamp exists).
+    audit_candidates = {}
     for row in tables["audit_log"]:
         subject_type = row.get("subject_type")   # None when loaded from live DB (already filtered)
         if subject_type and subject_type != "Raw File":
@@ -153,7 +208,23 @@ def build_mapping(tables):
         if not path:
             continue
         key = (row["subject_id"], row["subject_name"])
-        audit_index[key] = path
+        audit_candidates.setdefault(key, []).append(row)
+
+    # Phase 2: for each key pick the authoritative (latest) row; warn on duplicates.
+    audit_index = {}
+    for key, candidates in audit_candidates.items():
+        best = _pick_latest_audit_row(candidates)
+        audit_index[key] = best["subject_path"]
+        if len(candidates) > 1:
+            ts_used = next(
+                (c for c in _TS_CANDIDATES if best.get(c)), None
+            )
+            print(
+                f"WARNING: {len(candidates)} audit entries for subject_id={key[0]!r} "
+                f"name={key[1]!r}; using path '{best['subject_path']}' "
+                f"({'timestamp column: ' + ts_used if ts_used else 'last-in-sequence fallback'})",
+                file=sys.stderr,
+            )
 
     results = []
     for row in tables["RawData"]:

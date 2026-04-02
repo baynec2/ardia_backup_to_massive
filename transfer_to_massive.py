@@ -89,8 +89,9 @@ def build_mapping_from_db(dump=None, db_host=None, db_port=5432,
 # Transfer log
 # ---------------------------------------------------------------------------
 
-LOG_FIELDS = ["timestamp", "uuid", "local_path", "remote_path", "status",
-              "bytes_transferred", "error"]
+LOG_FIELDS = ["timestamp", "uuid", "local_path", "remote_path",
+              "previous_remote_path", "old_path_deleted",
+              "status", "bytes_transferred", "error"]
 
 
 def open_log(log_path):
@@ -104,14 +105,28 @@ def open_log(log_path):
 
 
 def load_completed(log_path):
-    """Return the set of remote_paths that previously succeeded."""
-    completed = set()
+    """
+    Return a dict mapping uuid -> {"remote_path": str, "previous_remote_path": str}
+    for all rows where status == "success".
+
+    Only the most recent success row per UUID is kept (later rows overwrite earlier
+    ones), which is correct because a re-upload after a move produces a new success
+    row with the updated remote_path.
+
+    Handles old-format logs that lack the new columns by using .get() with defaults.
+    """
+    completed = {}
     if not Path(log_path).exists():
         return completed
     with open(log_path, newline="") as f:
         for row in csv.DictReader(f):
             if row.get("status") == "success":
-                completed.add(row["remote_path"])
+                uuid = row.get("uuid", "")
+                if uuid:
+                    completed[uuid] = {
+                        "remote_path": row.get("remote_path", ""),
+                        "previous_remote_path": row.get("previous_remote_path", ""),
+                    }
     return completed
 
 
@@ -140,6 +155,19 @@ def ftp_makedirs(ftp, remote_dir):
         except ftplib.error_perm:
             ftp.mkd(path)
             ftp.cwd(path)
+
+
+def ftp_delete_safe(ftp, remote_path):
+    """
+    Attempt to delete remote_path on the FTP server.
+    Returns (True, "") on success, (False, error_message) on any failure.
+    Never raises.
+    """
+    try:
+        ftp.delete(remote_path)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def remote_file_size(ftp, remote_path):
@@ -203,13 +231,19 @@ def run_transfers(mapping, ftp_user, ftp_password, remote_base,
     completed = load_completed(log_path)
     log_file, log_writer = open_log(log_path)
 
-    # Filter to transferable rows
+    # Filter to transferable rows (include missing-local-path rows so the
+    # missing-file guard can emit a proper diagnostic instead of silently dropping them).
     transferable = [
         r for r in mapping
-        if r.get("local_path") and r.get("destination") and str(r.get("resolved")) != "False"
+        if r.get("destination") and str(r.get("resolved")) != "False"
     ]
-    skippable = [r for r in transferable
-                 if str(PurePosixPath(remote_base) / r["destination"].lstrip("/")) in completed]
+    skippable = [
+        r for r in transferable
+        if r.get("uuid") in completed
+        and completed[r["uuid"]]["remote_path"] == str(
+            PurePosixPath(remote_base) / r["destination"].lstrip("/")
+        )
+    ]
 
     print(f"\n{len(transferable)} files ready to transfer  "
           f"({len(skippable)} already completed, "
@@ -226,29 +260,63 @@ def run_transfers(mapping, ftp_user, ftp_password, remote_base,
         ftp = ftp_connect(ftp_user, ftp_password)
         print("Connected.\n")
 
-    ok = skip = fail = 0
+    ok = skip = fail = moved = 0
 
     for i, row in enumerate(transferable, 1):
-        local_path = row["local_path"]
+        local_path = row.get("local_path", "")
         destination = row["destination"].lstrip("/")
         remote_path = str(PurePosixPath(remote_base) / destination)
+        uuid = row.get("uuid", "")
 
-        print(f"[{i}/{len(transferable)}] {Path(local_path).name}  →  {remote_path}")
+        print(f"[{i}/{len(transferable)}] {Path(local_path).name if local_path else uuid}  →  {remote_path}")
 
-        if remote_path in completed:
-            print("  already transferred, skipping.")
-            skip += 1
-            continue
+        # --- Three-way dedup branch ---
+        prior = completed.get(uuid)
+        if prior is not None:
+            if prior["remote_path"] == remote_path:
+                # Case A: already at the correct path — clean skip.
+                print("  already transferred, skipping.")
+                skip += 1
+                continue
+            # Case B: file was moved — prior path differs from current destination.
+            prior_remote = prior["remote_path"]
+            print(f"  MOVED: previously uploaded to {prior_remote}, now targeting {remote_path}")
+        else:
+            prior_remote = ""  # Case C: new upload
 
         log_row = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "uuid": row.get("uuid", ""),
+            "uuid": uuid,
             "local_path": local_path,
             "remote_path": remote_path,
+            "previous_remote_path": prior_remote,
+            "old_path_deleted": "n/a",
             "status": "",
             "bytes_transferred": 0,
             "error": "",
         }
+
+        # --- Missing-file guard ---
+        if local_path and not Path(local_path).exists():
+            local_path = ""  # treat as missing
+        if not local_path:
+            if prior_remote:
+                msg = (
+                    f"LOCAL FILE MISSING: previously uploaded to {prior_remote} "
+                    f"and deleted locally, but Ardia destination has since changed "
+                    f"to {remote_path}. Manual intervention required: re-acquire "
+                    f"the file and re-run without --delete."
+                )
+                status = "missing_after_move"
+            else:
+                msg = f"LOCAL FILE MISSING: no file on disk for uuid={uuid!r}. Check --raw-dir."
+                status = "missing"
+            print(f"  WARNING: {msg}")
+            log_row.update(status=status, error=msg)
+            log_writer.writerow(log_row)
+            log_file.flush()
+            fail += 1
+            continue
 
         try:
             bytes_sent = upload_file(ftp, local_path, remote_path, dry_run=dry_run)
@@ -262,7 +330,28 @@ def run_transfers(mapping, ftp_user, ftp_password, remote_base,
                         f"Size mismatch: local={local_size}, remote={remote_size}"
                     )
 
-            log_row.update(status="success", bytes_transferred=bytes_sent)
+            # --- Post-upload cleanup of old MASSIVE path (Case B) ---
+            if prior_remote:
+                if dry_run:
+                    print(f"  [dry-run] would delete old MASSIVE copy at {prior_remote}")
+                    old_path_deleted_val = "skipped_dry_run"
+                else:
+                    deleted, del_err = ftp_delete_safe(ftp, prior_remote)
+                    if deleted:
+                        print(f"  Deleted old MASSIVE copy at {prior_remote}")
+                        old_path_deleted_val = "yes"
+                    else:
+                        print(f"  WARNING: could not delete old MASSIVE copy at {prior_remote}: {del_err}")
+                        old_path_deleted_val = "no"
+                moved += 1
+            else:
+                old_path_deleted_val = "n/a"
+
+            log_row.update(
+                status="success",
+                bytes_transferred=bytes_sent,
+                old_path_deleted=old_path_deleted_val,
+            )
             log_writer.writerow(log_row)
             log_file.flush()
             ok += 1
@@ -294,7 +383,7 @@ def run_transfers(mapping, ftp_user, ftp_password, remote_base,
             pass
 
     log_file.close()
-    print(f"\nDone. success={ok}  skipped={skip}  failed={fail}")
+    print(f"\nDone. success={ok} (of which moved={moved})  skipped={skip}  failed={fail}")
     print(f"Log written to: {log_path}")
 
 
