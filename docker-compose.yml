@@ -1,0 +1,11 @@
+services:
+  ardia-transfer:
+    image: baynec2/ardia-backup-to-massive:latest
+    restart: unless-stopped
+    environment:
+      FTP_USER: gonzolabucsd
+      FTP_PASSWORD: "${FTP_PASSWORD}"
+    volumes:
+      - /volume1/Ardia/infra-minio-backup:/data/db:ro
+      - /volume1/Ardia/backup-raw-data:/data/raw:ro
+      - /volume1/Ardia/transfer-logs:/data/output
