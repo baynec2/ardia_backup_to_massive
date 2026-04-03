@@ -135,9 +135,10 @@ def load_completed(log_path):
 # ---------------------------------------------------------------------------
 
 def ftp_connect(user, password):
-    ftp = ftplib.FTP()
+    ftp = ftplib.FTP_TLS()
     ftp.connect(FTP_HOST, FTP_PORT, timeout=CONNECT_TIMEOUT)
     ftp.login(user, password)
+    ftp.prot_p()   # switch data connection to TLS as well
     ftp.set_pasv(True)
     return ftp
 

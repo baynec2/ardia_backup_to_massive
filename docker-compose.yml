@@ -5,7 +5,8 @@ services:
     environment:
       FTP_USER: gonzolabucsd
       FTP_PASSWORD: "${FTP_PASSWORD}"
+    network_mode: host
     volumes:
-      - /volume1/Ardia/infra-minio-backup:/data/db:ro
-      - /volume1/Ardia/backup-raw-data:/data/raw:ro
+      - /volume1/Ardia/infra-minio-backup/backup-db:/data/db:ro
+      - /volume1/Ardia/infra-minio-backup/backup-raw-data:/data/raw:ro
       - /volume1/Ardia/transfer-logs:/data/output
